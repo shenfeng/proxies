@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"math/rand"
 	"net"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,34 +29,51 @@ type Backend struct { // real proxy server
 }
 
 type TServerConf struct {
-	Proxies   []Backend `json:"proxies"`
-	BlackList []string  `json:"black"`
+	Proxies   []*Backend `json:"proxies"`
+	BlackList []string   `json:"blacks"`
 
 	blacklist []*regexp.Regexp
-	groups    map[string]*Backend
+	groups    map[string][]*Backend
 }
 
 func readConfigFromBytes(data []byte) (*TServerConf, error) {
-	cfg := &TServerConf{groups: make(map[string]*Backend)}
+	cfg := &TServerConf{groups: make(map[string][]*Backend)}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	} else {
 		for _, b := range cfg.Proxies {
-			cfg.groups[b.Type] = &b
+			cfg.groups[b.Type] = append(cfg.groups[b.Type], b)
 			for _, g := range b.Groups {
-				cfg.groups[g] = &b
+				cfg.groups[g] = append(cfg.groups[g], b)
 			}
 		}
 		return cfg, nil
 	}
 }
 
+func (c *TServerConf) findProxy(host string, group string) *Backend {
+	use_proxy := false
+	for _, black := range c.BlackList {
+		if strings.Contains(host, black) {
+			use_proxy = true
+			break
+		}
+	}
+
+	if use_proxy && len(c.groups[group]) > 0 {
+		ss := c.groups[group]
+		return ss[rand.Intn(len(ss))]
+	}
+
+	return nil
+}
+
 func (s *Server) getConn(addr string, d time.Duration) (con *persistConn, err error) {
 	s.idleMu.Lock()
 	conns := s.idleConn[addr]
 	if len(conns) > 0 {
-		con = conns[len(conns) - 1]
-		s.idleConn[addr] = conns[0 : len(conns) - 1]
+		con = conns[len(conns)-1]
+		s.idleConn[addr] = conns[0 : len(conns)-1]
 	}
 	s.idleMu.Unlock()
 
@@ -64,7 +83,7 @@ func (s *Server) getConn(addr string, d time.Duration) (con *persistConn, err er
 	if c, err := net.DialTimeout("tcp", addr, d); err == nil {
 		return &persistConn{
 			cacheKey: addr,
-			conn: c,
+			conn:     c,
 		}, nil
 	} else {
 		return nil, err
@@ -85,8 +104,8 @@ func (s *Server) returnConn(p *persistConn) {
 func (s *Backend) getConn(d time.Duration) (con net.Conn, err error) {
 	s.mu.Lock()
 	if len(s.connections) > 0 {
-		con = s.connections[len(s.connections) - 1]
-		s.connections = s.connections[0 : len(s.connections) - 1]
+		con = s.connections[len(s.connections)-1]
+		s.connections = s.connections[0 : len(s.connections)-1]
 	}
 	s.mu.Unlock()
 
@@ -110,7 +129,7 @@ func (s *Backend) returnConn(c net.Conn) {
 
 type persistConn struct {
 	cacheKey string // addr
-	conn      net.Conn
+	conn     net.Conn
 }
 
 // An AtomicInt is an int64 to be accessed atomically.

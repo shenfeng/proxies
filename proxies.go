@@ -1,19 +1,21 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const (
 	MaxRetry      = 5
-	LatencySize   = 128
+	LatencySize   = 12
 	MaxConPerHost = 3
 )
 
@@ -65,62 +67,98 @@ func (s *Server) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
 	}
 }
 
-func (s *Server) httpTunnel(w http.ResponseWriter, r *http.Request) {
+func copyConn(iconn net.Conn, oconn net.Conn) {
+	buffer := [4096]byte{}
+	for {
+		if n, err := iconn.Read(buffer[:]); err == nil {
+			oconn.Write(buffer[:n])
+		} else {
+			iconn.Close()
+			oconn.Close()
+			return
+		}
+	}
+}
 
+func readData(con net.Conn, bytes int) (r []byte, e error) {
+	r = make([]byte, bytes)
+	nread := 0
+	for nread < bytes {
+		if n, err := con.Read(r[nread:]); err == nil {
+			nread += n
+		} else {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+func (s *Server) tunnelTraffic(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(200)
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
+		return
+	}
+	iconn, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
+		// connect directly
+		if oconn, err := net.DialTimeout("tcp", r.URL.Host, time.Second*8); err == nil {
+			go copyConn(iconn, oconn)
+			go copyConn(oconn, iconn)
+		} else {
+			log.Printf("direct dial %v, error: %v", r.URL.Host, err)
+			iconn.Close()
+		}
+	} else { // socks proxy
+		// socks5: http://www.ietf.org/rfc/rfc1928.txt
+		if oconn, err := net.DialTimeout("tcp", proxy.Addr, time.Second*8); err == nil {
+			oconn.Write([]byte{ // VERSION_AUTH
+				5, // PROTO_VER5
+				1, //
+				0, // NO_AUTH
+			})
+
+			buffer := [64]byte{}
+			oconn.Read(buffer[:])
+
+			buffer[0] = 5 // VER  5
+			buffer[1] = 1 // CMD connect
+			buffer[2] = 0 // RSV
+			buffer[3] = 3 // DOMAINNAME: X'03'
+
+			host, port, _ := net.SplitHostPort(r.URL.Host)
+			portN, _ := strconv.Atoi(port)
+			hostBytes := []byte(host)
+			buffer[4] = byte(len(hostBytes))
+			copy(buffer[5:], hostBytes)
+			binary.BigEndian.PutUint16(buffer[5+len(hostBytes):], uint16(portN))
+			oconn.Write(buffer[:5+len(hostBytes)+2])
+
+			if n, err := oconn.Read(buffer[:]); n > 1 && err == nil && buffer[1] == 0 {
+				go copyConn(iconn, oconn)
+				go copyConn(oconn, iconn)
+			} else {
+				log.Printf("connet to socks server %s error: %v", proxy.Addr, err)
+			}
+		} else {
+			log.Println("dial socks server %v, error: %v", proxy.Addr, err)
+			iconn.Close()
+		}
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "CONNECT" {
-		w.WriteHeader(200)
-
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
-			return
-		}
-		iconn, _, err := hj.Hijack()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if oconn, err := net.DialTimeout("tcp", r.URL.Host, time.Millisecond*1000); err == nil {
-			go func() { // read loop
-				buffer := [4096]byte{}
-				for {
-					if n, err := iconn.Read(buffer[:]); err == nil {
-						log.Println("read iconn", n, iconn.RemoteAddr())
-						oconn.Write(buffer[:n])
-					} else {
-						log.Println("------", err)
-						iconn.Close()
-						oconn.Close()
-						break
-					}
-				}
-			}()
-
-			go func() { // write loop
-				buffer := [4096]byte{}
-				for {
-					if n, err := oconn.Read(buffer[:]); err == nil {
-						log.Println("read oconn", n, oconn.LocalAddr())
-						iconn.Write(buffer[:n])
-					} else {
-						log.Println("------wwww", err)
-						iconn.Close()
-						oconn.Close()
-						break
-					}
-				}
-			}()
-		} else {
-			log.Println("dial timeout")
-			iconn.Close()
-		}
+		s.tunnelTraffic(w, r)
 	} else {
-		log.Println(r.URL, r)
-		//		s.fetchFromHttpProxy(w, r)
+		log.Println(r.URL)
 		s.fetchDirectly(w, r)
 	}
 }
