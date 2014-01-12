@@ -3,11 +3,14 @@ package main
 import (
 	"encoding/json"
 	"math/rand"
+	"encoding/binary"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
+	"net/http"
 	"sync"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -68,12 +71,13 @@ func (c *TServerConf) findProxy(host string, group string) *Backend {
 	return nil
 }
 
+
 func (s *Server) getConn(addr string, d time.Duration) (con *persistConn, err error) {
 	s.idleMu.Lock()
 	conns := s.idleConn[addr]
 	if len(conns) > 0 {
-		con = conns[len(conns)-1]
-		s.idleConn[addr] = conns[0 : len(conns)-1]
+		con = conns[len(conns) - 1]
+		s.idleConn[addr] = conns[0 : len(conns) - 1]
 	}
 	s.idleMu.Unlock()
 
@@ -100,19 +104,52 @@ func (s *Server) returnConn(p *persistConn) {
 	s.idleMu.Unlock()
 }
 
-// if return err, should retry sometime later
-func (s *Backend) getConn(d time.Duration) (con net.Conn, err error) {
-	s.mu.Lock()
-	if len(s.connections) > 0 {
-		con = s.connections[len(s.connections)-1]
-		s.connections = s.connections[0 : len(s.connections)-1]
+func splitHostAndPort(host string) (string, uint16) {
+	if idx := strings.Index(host, ":"); idx < 0 {
+		return host, 80
+	} else {
+		port, _ := strconv.Atoi(host[idx+1:])
+		return host[:idx], uint16(port)
 	}
-	s.mu.Unlock()
 
-	if con != nil {
-		return
+}
+
+// if return err, should retry sometime later
+func (s *Backend) openConn(d time.Duration, r *http.Request) (con net.Conn, err error) {
+	if oconn, err := net.DialTimeout("tcp", s.Addr, d); err == nil {
+		if (s.Type == "socks") {
+			// socks5: http://www.ietf.org/rfc/rfc1928.txt
+			oconn.Write([]byte{ // VERSION_AUTH
+				5, // PROTO_VER5
+				1, //
+				0, // NO_AUTH
+			})
+
+			buffer := [64]byte{}
+			oconn.Read(buffer[:])
+
+			buffer[0] = 5 // VER  5
+			buffer[1] = 1 // CMD connect
+			buffer[2] = 0 // RSV
+			buffer[3] = 3 // DOMAINNAME: X'03'
+
+			host, port := splitHostAndPort(r.URL.Host)
+			hostBytes := []byte(host)
+			buffer[4] = byte(len(hostBytes))
+			copy(buffer[5:], hostBytes)
+			binary.BigEndian.PutUint16(buffer[5 + len(hostBytes):], uint16(port))
+			oconn.Write(buffer[:5 + len(hostBytes) + 2])
+			if n, err := oconn.Read(buffer[:]); n > 1 && err == nil && buffer[1] == 0 {
+				return oconn, nil
+			} else {
+				return nil, fmt.Errorf("connet to socks server %s error: %v", s.Addr, err)
+			}
+		} else {
+			return oconn, err
+		}
+	} else {
+		return nil, err
 	}
-	return net.DialTimeout("tcp", s.Addr, d)
 }
 
 func (s *Backend) returnConn(c net.Conn) {

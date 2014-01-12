@@ -1,14 +1,17 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"path"
+	"net/url"
 	"net"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -21,12 +24,16 @@ const (
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	if t, ok := http.DefaultClient.Transport.(*http.Transport); ok {
+		t.MaxIdleConnsPerHost = 4
+	}
 }
 
 type Server struct {
 	conf     *TServerConf
 	idleConn map[string][]*persistConn
 	idleMu   sync.Mutex
+	cachedir string
 }
 
 func NewServer(filename string) (server *Server, e error) {
@@ -43,6 +50,50 @@ func NewServer(filename string) (server *Server, e error) {
 
 func (s *Server) fetchFromHttpProxy(w http.ResponseWriter, r *http.Request) {
 
+}
+
+func cacheTime(resp *http.Response) int {
+	if cc := resp.Header.Get("Cache-Control"); strings.Contains(cc, "max-age=") {
+//		return 1
+//		if c, err := strconv.Atoi(cc[len("max-age="):]); err == nil {
+//			return c
+//		}
+	}
+	return 0;
+}
+
+func (s *Server) getCacheName(ireq *http.Request) (cachename string, fullpath string) {
+	cachename = path.Join(ireq.URL.Host, url.QueryEscape(ireq.URL.RequestURI()))
+	fullpath = path.Join(s.cachedir, cachename)
+	return
+}
+
+
+func (s *Server) copyAndSave(w http.ResponseWriter, resp *http.Response, ireq *http.Request) {
+	c := cacheTime(resp)
+	if resp.StatusCode == 200 && c > 0 {
+		_, fullpath := s.getCacheName(ireq)
+		os.MkdirAll(filepath.Dir(fullpath), 0755)
+		if file, err := os.Create(fullpath); err == nil {
+			log.Println("write to", fullpath)
+			buf := make([]byte, 32*1024)
+			for {
+				nr, er := resp.Body.Read(buf)
+				if er == nil {
+					_, _ = w.Write(buf[0:nr])
+					file.Write(buf[0:nr])
+				} else {
+					break
+				}
+			}
+			file.Close()
+		} else {
+			log.Println("open write cache error:", err)
+			io.Copy(w, resp.Body)
+		}
+	} else {
+		io.Copy(w, resp.Body)
+	}
 }
 
 func (s *Server) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
@@ -62,7 +113,7 @@ func (s *Server) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
 			}
 			defer resp.Body.Close()
 			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
+			s.copyAndSave(w, resp, ireq)
 		}
 	}
 }
@@ -108,6 +159,7 @@ func (s *Server) tunnelTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
+		log.Printf("direct tunnel %v", r.URL.Host)
 		// connect directly
 		if oconn, err := net.DialTimeout("tcp", r.URL.Host, time.Second*8); err == nil {
 			go copyConn(iconn, oconn)
@@ -117,36 +169,10 @@ func (s *Server) tunnelTraffic(w http.ResponseWriter, r *http.Request) {
 			iconn.Close()
 		}
 	} else { // socks proxy
-		// socks5: http://www.ietf.org/rfc/rfc1928.txt
-		if oconn, err := net.DialTimeout("tcp", proxy.Addr, time.Second*8); err == nil {
-			oconn.Write([]byte{ // VERSION_AUTH
-				5, // PROTO_VER5
-				1, //
-				0, // NO_AUTH
-			})
-
-			buffer := [64]byte{}
-			oconn.Read(buffer[:])
-
-			buffer[0] = 5 // VER  5
-			buffer[1] = 1 // CMD connect
-			buffer[2] = 0 // RSV
-			buffer[3] = 3 // DOMAINNAME: X'03'
-
-			host, port, _ := net.SplitHostPort(r.URL.Host)
-			portN, _ := strconv.Atoi(port)
-			hostBytes := []byte(host)
-			buffer[4] = byte(len(hostBytes))
-			copy(buffer[5:], hostBytes)
-			binary.BigEndian.PutUint16(buffer[5+len(hostBytes):], uint16(portN))
-			oconn.Write(buffer[:5+len(hostBytes)+2])
-
-			if n, err := oconn.Read(buffer[:]); n > 1 && err == nil && buffer[1] == 0 {
-				go copyConn(iconn, oconn)
-				go copyConn(oconn, iconn)
-			} else {
-				log.Printf("connet to socks server %s error: %v", proxy.Addr, err)
-			}
+		log.Printf("socks tunnel %v, by %v", r.URL.Host, proxy.Addr)
+		if oconn, err := proxy.openConn(time.Second*8, r); err == nil {
+			go copyConn(iconn, oconn)
+			go copyConn(oconn, iconn)
 		} else {
 			log.Println("dial socks server %v, error: %v", proxy.Addr, err)
 			iconn.Close()
@@ -158,19 +184,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "CONNECT" {
 		s.tunnelTraffic(w, r)
 	} else {
-		log.Println(r.URL)
-		s.fetchDirectly(w, r)
+		if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
+			log.Println("directly: ", r.URL)
+			s.fetchDirectly(w, r)
+		} else {
+			if iconn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				if oconn, err := proxy.openConn(time.Second*8, r); err == nil {
+					log.Printf("proxy by %v: %v", proxy.Addr, r.URL.Host)
+					r.Write(oconn)
+					go copyConn(iconn, oconn)
+					go copyConn(oconn, iconn)
+				} else {
+					log.Println("open proxy failed", proxy.Addr, err)
+					iconn.Close()
+				}
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+		}
 	}
 }
 
 func main() {
-	var addr, httpAdmin, conf string
+	var addr, httpAdmin, conf, cachedir string
 	flag.StringVar(&addr, "addr", "0.0.0.0:6666", "Which Addr the proxy listens")
 	flag.StringVar(&httpAdmin, "http", "0.0.0.0:6060", "HTTP admin addr")
 	flag.StringVar(&conf, "conf", "config.json", "Config file")
+	flag.StringVar(&cachedir, "cache", "/tmp/pcache", "proxy cache file directory")
 	flag.Parse()
 
 	if server, err := NewServer(conf); err == nil {
+		server.cachedir = cachedir
 		log.Println("Proxy multiplexer listens on", addr)
 		log.Fatal(http.ListenAndServe(addr, server))
 	} else {
