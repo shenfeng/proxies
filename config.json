@@ -1,0 +1,30 @@
+{
+    "proxies": [
+        {
+            "addr": "localhost:3128",
+            "type": "socks"
+        }, {
+            "addr": "91.213.108.178:80",
+            "type": "http"
+        }, {
+            "addr": "94.203.111.63:80",
+            "type": "http"
+        }, {
+            "addr": "94.203.216.197:80",
+            "type": "http"
+        }, {
+            "addr": "199.58.161.181:7808",
+            "type": "http"
+        }, {
+            "addr": "190.38.212.100:8080",
+            "type": "http"
+        }
+    ],
+    "blacks": [
+        "twitter",
+        "developer.chrome.com",
+        "youtube",
+        "facebook",
+        "blogspot"
+    ]
+}
