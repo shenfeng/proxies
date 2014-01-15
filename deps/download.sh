@@ -4,9 +4,18 @@ if [ ! -d deps/leveldb ]; then
     echo "cloning leveldb from google code"
     (mkdir -p deps && cd deps && git clone https://code.google.com/p/leveldb/ && cd leveldb && make -j)
     sudo cp -r deps/leveldb/include/leveldb /usr/local/include/
-    sudo cp deps/leveldb/libleveldb.so.1.15 /usr/lib
-    sudo ln -s /usr/lib/libleveldb.so.1.15 /usr/lib/libleveldb.so
-    sudo ln -s /usr/lib/libleveldb.so.1.15 /usr/lib/libleveldb.so.1
+    case $OSTYPE in
+        linux-gnu)
+            sudo cp deps/leveldb/libleveldb.so.1.15 /usr/lib
+            sudo ln -s /usr/lib/libleveldb.so.1.15 /usr/lib/libleveldb.so
+            sudo ln -s /usr/lib/libleveldb.so.1.15 /usr/lib/libleveldb.so.1
+            ;;
+        *)                      #  os x
+            cp deps/leveldb/libleveldb.dylib.1.15 /usr/lib
+            sudo ln -s /usr/lib/libleveldb.dylib.1.15 /usr/lib/libleveldb.dylib
+            ;;
+    esac
+
 else
     echo "update leveldb from google code"
     (cd deps/leveldb && git pull && make -j)

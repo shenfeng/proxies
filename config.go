@@ -142,6 +142,7 @@ func (s *Backend) openConn(d time.Duration, r *http.Request) (con net.Conn, err 
 			if n, err := oconn.Read(buffer[:]); n > 1 && err == nil && buffer[1] == 0 {
 				return oconn, nil
 			} else {
+				oconn.Close()
 				return nil, fmt.Errorf("connet to socks server %s error: %v", s.Addr, err)
 			}
 		} else {

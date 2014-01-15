@@ -5,13 +5,14 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
-	"path"
-	"net/url"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"bytes"
+	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,12 +55,12 @@ func (s *Server) fetchFromHttpProxy(w http.ResponseWriter, r *http.Request) {
 
 func cacheTime(resp *http.Response) int {
 	if cc := resp.Header.Get("Cache-Control"); strings.Contains(cc, "max-age=") {
-//		return 1
-//		if c, err := strconv.Atoi(cc[len("max-age="):]); err == nil {
-//			return c
-//		}
+		//		return 1
+		//		if c, err := strconv.Atoi(cc[len("max-age="):]); err == nil {
+		//			return c
+		//		}
 	}
-	return 0;
+	return 0
 }
 
 func (s *Server) getCacheName(ireq *http.Request) (cachename string, fullpath string) {
@@ -67,7 +68,6 @@ func (s *Server) getCacheName(ireq *http.Request) (cachename string, fullpath st
 	fullpath = path.Join(s.cachedir, cachename)
 	return
 }
-
 
 func (s *Server) copyAndSave(w http.ResponseWriter, resp *http.Response, ireq *http.Request) {
 	c := cacheTime(resp)
@@ -144,19 +144,7 @@ func readData(con net.Conn, bytes int) (r []byte, e error) {
 	return r, nil
 }
 
-func (s *Server) tunnelTraffic(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(200)
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
-		return
-	}
-	iconn, _, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+func (s *Server) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *http.Request) {
 
 	if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
 		log.Printf("direct tunnel %v", r.URL.Host)
@@ -181,28 +169,60 @@ func (s *Server) tunnelTraffic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "CONNECT" {
-		s.tunnelTraffic(w, r)
+
+	if in, _, err := w.(http.Hijacker).Hijack(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	} else if r.Method == "CONNECT" {
+		w.WriteHeader(200)
+		s.tunnelTraffic(in, w, r)
 	} else {
-		if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
+
+		req := bytes.NewBuffer(make([]byte, 0, 4096))
+		if r.Header.Get("Accept-Encoding") == "" && r.Method != "HEAD" {
+			r.Header.Set("Accept-Encoding", "gzip") // gzip is good
+		}
+
+		proxy := s.conf.findProxy(r.URL.Host, "socks")
+
+		if proxy != nil && proxy.Type == "http" {
+			r.WriteProxy(req)
+		} else {
+			r.Write(req)
+		}
+
+		buffer := req.Bytes() // request
+
+
+
+
+
+
+//		r.Write(req)
+
+		if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy != nil {
+			r.WriteProxy(req)
+
+
+
 			log.Println("directly: ", r.URL)
 			s.fetchDirectly(w, r)
 		} else {
-			if iconn, _, err := w.(http.Hijacker).Hijack(); err == nil {
-				if oconn, err := proxy.openConn(time.Second*8, r); err == nil {
-					log.Printf("proxy by %v: %v", proxy.Addr, r.URL.Host)
-					r.Write(oconn)
-					go copyConn(iconn, oconn)
-					go copyConn(oconn, iconn)
-				} else {
-					log.Println("open proxy failed", proxy.Addr, err)
-					iconn.Close()
-				}
+
+			r.Write(req)
+
+			if oconn, err := proxy.openConn(time.Second*8, r); err == nil {
+				log.Printf("proxy by %v: %v", proxy.Addr, r.URL.Host)
+				r.Write(oconn)
+				go copyConn(in, oconn)
+				go copyConn(oconn, in)
 			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				log.Println("open proxy failed", proxy.Addr, err)
+				in.Close()
 			}
 		}
+
 	}
+
 }
 
 func main() {
