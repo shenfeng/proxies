@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"bytes"
 	"path"
 	"path/filepath"
 	"strings"
@@ -21,6 +21,7 @@ const (
 	MaxRetry      = 5
 	LatencySize   = 12
 	MaxConPerHost = 3
+	DailTimeOut   = 10 * time.Second
 )
 
 func init() {
@@ -30,17 +31,18 @@ func init() {
 	}
 }
 
-type Server struct {
-	conf     *TServerConf
-	idleConn map[string][]*persistConn
+type ProxyServer struct {
+	conf *TServerConf
+
+	idleConn map[string][]*Connection
 	idleMu   sync.Mutex
 	cachedir string
 }
 
-func NewServer(filename string) (server *Server, e error) {
+func NewServer(filename string) (server *ProxyServer, e error) {
 	if data, err := ioutil.ReadFile(filename); err == nil {
 		if conf, err := readConfigFromBytes(data); err == nil {
-			return &Server{conf: conf, idleConn: make(map[string][]*persistConn)}, err
+			return &ProxyServer{conf: conf, idleConn: make(map[string][]*Connection)}, err
 		} else {
 			return nil, err
 		}
@@ -49,7 +51,7 @@ func NewServer(filename string) (server *Server, e error) {
 	}
 }
 
-func (s *Server) fetchFromHttpProxy(w http.ResponseWriter, r *http.Request) {
+func (s *ProxyServer) fetchFromHttpProxy(w http.ResponseWriter, r *http.Request) {
 
 }
 
@@ -63,13 +65,13 @@ func cacheTime(resp *http.Response) int {
 	return 0
 }
 
-func (s *Server) getCacheName(ireq *http.Request) (cachename string, fullpath string) {
+func (s *ProxyServer) getCacheName(ireq *http.Request) (cachename string, fullpath string) {
 	cachename = path.Join(ireq.URL.Host, url.QueryEscape(ireq.URL.RequestURI()))
 	fullpath = path.Join(s.cachedir, cachename)
 	return
 }
 
-func (s *Server) copyAndSave(w http.ResponseWriter, resp *http.Response, ireq *http.Request) {
+func (s *ProxyServer) copyAndSave(w http.ResponseWriter, resp *http.Response, ireq *http.Request) {
 	c := cacheTime(resp)
 	if resp.StatusCode == 200 && c > 0 {
 		_, fullpath := s.getCacheName(ireq)
@@ -96,7 +98,7 @@ func (s *Server) copyAndSave(w http.ResponseWriter, resp *http.Response, ireq *h
 	}
 }
 
-func (s *Server) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
+func (s *ProxyServer) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
 	if req, err := http.NewRequest(ireq.Method, ireq.URL.String(), ireq.Body); err == nil {
 		for k, values := range ireq.Header {
 			for _, v := range values {
@@ -144,7 +146,7 @@ func readData(con net.Conn, bytes int) (r []byte, e error) {
 	return r, nil
 }
 
-func (s *Server) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *http.Request) {
+func (s *ProxyServer) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *http.Request) {
 
 	if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
 		log.Printf("direct tunnel %v", r.URL.Host)
@@ -168,7 +170,16 @@ func (s *Server) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *http.Re
 	}
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *ProxyServer) fetchHTTP(c *Connection, req []byte) (*http.Response, error) {
+	c.Conn.SetDeadline(time.Now().Add(time.Minute*1))
+	if _, err := c.Conn.Write(req); err != nil {
+		return nil, err
+	} else {
+		return http.ReadResponse(c.Reader, c.Request)
+	}
+}
+
+func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if in, _, err := w.(http.Hijacker).Hijack(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -176,33 +187,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		s.tunnelTraffic(in, w, r)
 	} else {
+		for {
+			req := bytes.NewBuffer(make([]byte,0, 4096))
+			if r.Header.Get("Accept-Encoding") == "" && r.Method != "HEAD" {
+				r.Header.Set("Accept-Encoding", "gzip") // gzip is good
+			}
 
-		req := bytes.NewBuffer(make([]byte, 0, 4096))
-		if r.Header.Get("Accept-Encoding") == "" && r.Method != "HEAD" {
-			r.Header.Set("Accept-Encoding", "gzip") // gzip is good
+			proxy := s.conf.findProxy(r.URL.Host, "socks")
+
+			if proxy != nil && proxy.Type == "http" {
+				r.WriteProxy(req)
+			} else {
+				r.Write(req)
+			}
+
+			buffer := req.Bytes() // request
+
+			s.fetchHTTP()
 		}
 
-		proxy := s.conf.findProxy(r.URL.Host, "socks")
-
-		if proxy != nil && proxy.Type == "http" {
-			r.WriteProxy(req)
-		} else {
-			r.Write(req)
-		}
-
-		buffer := req.Bytes() // request
-
-
-
-
-
-
-//		r.Write(req)
+		//		r.Write(req)
 
 		if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy != nil {
 			r.WriteProxy(req)
-
-
 
 			log.Println("directly: ", r.URL)
 			s.fetchDirectly(w, r)
