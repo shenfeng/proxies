@@ -1,6 +1,9 @@
 package main
 
-import "io"
+import (
+	"io"
+	"strings"
+)
 
 type PushBackReader struct {
 	reader io.Reader
@@ -12,7 +15,7 @@ type PushBackReader struct {
 func NewPushBackReader(reader io.Reader, buffer int) *PushBackReader {
 	return &PushBackReader{
 		reader: reader,
-		buffer: make([]byte, 0, buffer),
+		buffer: make([]byte,0, buffer),
 		idx:    0,
 		limit:  0,
 	}
@@ -34,7 +37,7 @@ func (r *PushBackReader) Read(p []byte) (n int, err error) {
 
 func (r *PushBackReader) UnRead(p []byte) {
 	if r.idx > len(p) {
-		copy(r.buffer[r.idx-len(p):r.idx], p)
+		copy(r.buffer[r.idx - len(p):r.idx], p)
 		r.idx -= len(p)
 	} else {
 		r.buffer = append(r.buffer[:r.limit], p...)
@@ -43,4 +46,15 @@ func (r *PushBackReader) UnRead(p []byte) {
 }
 
 
-
+func (r *PushBackReader) IsHttpGet(addr string) bool {
+	if strings.HasSuffix(addr, "80") { // only for HTTP port
+		buf := [3]byte{}
+		if n, err := r.Read(buf[:]); err == nil {
+			r.UnRead(buf[:n])
+			if "GET" == string(buf[:n]) {
+				return true
+			}
+		}
+	}
+	return false
+}

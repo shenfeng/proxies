@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ type Connection struct {
 	Conn       net.Conn
 	Addr       string
 	LastActive time.Time
+
+	Brw *bufio.ReadWriter
 
 	Reader  *bufio.Reader
 	Request *http.Request
@@ -129,6 +132,24 @@ func readConfigFromBytes(data []byte) (*TServerConf, error) {
 	}
 }
 
+func getProxyHash(header http.Header) int {
+	if h := header.Get("X-Proxy-Hash"); h != "" {
+		if n, err := strconv.Atoi(h); err != nil {
+			return n
+		}
+	}
+	return rand.Int()
+}
+
+func getHost(r *http.Request) string {
+	h := r.URL.Host
+	if strings.Contains(":") {
+		return h
+	} else {
+		return fmt.Sprint("%s:80", h)
+	}
+}
+
 func (c *TServerConf) findProxy(host string, hash int) *Backend {
 	group := ""
 	for server, g := range c.Configs {
@@ -158,12 +179,14 @@ func splitHostAndPort(host string) (string, uint16) {
 		port, _ := strconv.Atoi(host[idx + 1:])
 		return host[:idx], uint16(port)
 	}
+}
 
+func (p *Backend) markBroken() {
+	p.Dead.Set(1)
 }
 
 func (p *Backend) getConn(addr string) (con *Connection, err error) {
 	p.mu.Lock()
-
 	if len(p.connections) > 0 {
 		con = p.connections[len(p.connections) - 1]
 		p.connections = p.connections[0 : len(p.connections) - 1]
@@ -173,21 +196,22 @@ func (p *Backend) getConn(addr string) (con *Connection, err error) {
 		return
 	}
 
-	oconn, err := net.DialTimeout("tcp", addr, DailTimeOut);
+	conn, err := net.DialTimeout("tcp", addr, DailTimeOut);
 	if err != nil {
+		p.markBroken()
 		return nil, err
 	}
 
 	if p.Type == "socks" {
 		// socks5: http://www.ietf.org/rfc/rfc1928.txt
-		oconn.Write([]byte{ // VERSION_AUTH
+		conn.Write([]byte{ // VERSION_AUTH
 			5, // PROTO_VER5
 			1, //
 			0, // NO_AUTH
 		})
 
 		buffer := [64]byte{}
-		oconn.Read(buffer[:])
+		conn.Read(buffer[:])
 
 		buffer[0] = 5 // VER  5
 		buffer[1] = 1 // CMD connect
@@ -199,18 +223,17 @@ func (p *Backend) getConn(addr string) (con *Connection, err error) {
 		buffer[4] = byte(len(hostBytes))
 		copy(buffer[5:], hostBytes)
 		binary.BigEndian.PutUint16(buffer[5 + len(hostBytes):], uint16(port))
-		oconn.Write(buffer[:5 + len(hostBytes) + 2])
-		if n, err := oconn.Read(buffer[:]); n > 1 && err == nil && buffer[1] == 0 {
-
-		} else {
-			oconn.Close()
+		conn.Write(buffer[:5 + len(hostBytes) + 2])
+		if _, err := conn.Read(buffer[:]); err != nil || buffer[1] != 0 {
+			p.markBroken()
+			conn.Close()
 			return nil, fmt.Errorf("connet to socks server %s error: %v", addr, err)
 		}
 	}
 
-	ureader := NewPushBackReader(oconn, 10)
+	ureader := NewPushBackReader(conn, 10)
 	return &Connection{
-		Conn: oconn,
+		Conn: conn,
 		Addr: addr,
 		ureader: ureader,
 		Reader: bufio.NewReader(ureader),

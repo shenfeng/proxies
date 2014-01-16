@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"flag"
 	"io"
@@ -37,6 +38,7 @@ type ProxyServer struct {
 	idleConn map[string][]*Connection
 	idleMu   sync.Mutex
 	cachedir string
+	cache    Cache
 }
 
 func NewServer(filename string) (server *ProxyServer, e error) {
@@ -120,14 +122,14 @@ func (s *ProxyServer) fetchDirectly(w http.ResponseWriter, ireq *http.Request) {
 	}
 }
 
-func copyConn(iconn net.Conn, oconn net.Conn) {
+func copyConn(in io.ReadWriteCloser, out io.ReadWriteCloser) {
 	buffer := [4096]byte{}
 	for {
-		if n, err := iconn.Read(buffer[:]); err == nil {
-			oconn.Write(buffer[:n])
+		if n, err := in.Read(buffer[:]); err == nil {
+			out.Write(buffer[:n])
 		} else {
-			iconn.Close()
-			oconn.Close()
+			in.Close()
+			out.Close()
 			return
 		}
 	}
@@ -146,8 +148,7 @@ func readData(con net.Conn, bytes int) (r []byte, e error) {
 	return r, nil
 }
 
-func (s *ProxyServer) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *http.Request) {
-
+func (s *ProxyServer) tunnelTraffic(iconn net.Conn, brw *bufio.ReadWriter, r *http.Request) {
 	if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy == nil {
 		log.Printf("direct tunnel %v", r.URL.Host)
 		// connect directly
@@ -171,7 +172,7 @@ func (s *ProxyServer) tunnelTraffic(iconn net.Conn, w http.ResponseWriter, r *ht
 }
 
 func (s *ProxyServer) fetchHTTP(c *Connection, req []byte) (*http.Response, error) {
-	c.Conn.SetDeadline(time.Now().Add(time.Minute*1))
+	c.Conn.SetDeadline(time.Now().Add(time.Minute * 1))
 	if _, err := c.Conn.Write(req); err != nil {
 		return nil, err
 	} else {
@@ -179,54 +180,48 @@ func (s *ProxyServer) fetchHTTP(c *Connection, req []byte) (*http.Response, erro
 	}
 }
 
+func (s *ProxyServer) proxyHttp(r *http.Request, c *Connection) {
+
+}
+
 func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	if in, _, err := w.(http.Hijacker).Hijack(); err != nil {
+	in, brw, err := w.(http.Hijacker).Hijack()
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-	} else if r.Method == "CONNECT" {
+		return
+	}
+
+	hash := getProxyHash(r.Header)
+	ureader := NewPushBackReader(in, 10)
+	reader := bufio.NewReader(ureader)
+
+	addr := getHost(r)
+
+	if r.Method == "CONNECT" {
 		w.WriteHeader(200)
-		s.tunnelTraffic(in, w, r)
-	} else {
-		for {
-			req := bytes.NewBuffer(make([]byte,0, 4096))
-			if r.Header.Get("Accept-Encoding") == "" && r.Method != "HEAD" {
-				r.Header.Set("Accept-Encoding", "gzip") // gzip is good
-			}
 
-			proxy := s.conf.findProxy(r.URL.Host, "socks")
-
-			if proxy != nil && proxy.Type == "http" {
-				r.WriteProxy(req)
+		if conn, err := s.getConn(addr, hash); err == nil {
+			if ureader.IsHttpGet(addr) {
+				for {
+					r, err := http.ReadRequest(reader)
+					if err != nil {
+						break
+					}
+					r.Write(conn.Brw)
+					resp, err := http.ReadResponse(conn.Brw, r)
+					if err != nil {
+						break
+					}
+					resp.Write(brw)
+				}
 			} else {
-				r.Write(req)
+				go copyConn(conn, in)
+				go copyConn(in, conn)
 			}
-
-			buffer := req.Bytes() // request
-
-			s.fetchHTTP()
-		}
-
-		//		r.Write(req)
-
-		if proxy := s.conf.findProxy(r.URL.Host, "socks"); proxy != nil {
-			r.WriteProxy(req)
-
-			log.Println("directly: ", r.URL)
-			s.fetchDirectly(w, r)
 		} else {
-
-			r.Write(req)
-
-			if oconn, err := proxy.openConn(time.Second*8, r); err == nil {
-				log.Printf("proxy by %v: %v", proxy.Addr, r.URL.Host)
-				r.Write(oconn)
-				go copyConn(in, oconn)
-				go copyConn(oconn, in)
-			} else {
-				log.Println("open proxy failed", proxy.Addr, err)
-				in.Close()
-			}
+			s.returnConn(conn, true)
 		}
+	} else {
 
 	}
 
