@@ -17,9 +17,12 @@ import (
 )
 
 type Connection struct {
-	Conn       net.Conn
+	out        net.Conn // remote server or proxy server
+	in         net.Conn // client
+
 	Addr       string
 	LastActive time.Time
+
 
 	Brw *bufio.ReadWriter
 
@@ -28,6 +31,7 @@ type Connection struct {
 	Backend   *Backend
 
 	ureader *PushBackReader
+	broken bool
 }
 
 type Backend struct { // real proxy server
@@ -90,7 +94,7 @@ func (s *ProxyServer) getConn(addr string, hash int) (*Connection, error) {
 	if c, err := net.DialTimeout("tcp", addr, DailTimeOut); err == nil {
 		ureader := NewPushBackReader(c, 10)
 		return &Connection{
-			Conn:    c,
+			out:    c,
 			Addr:    addr,
 			ureader: ureader,
 			Reader:  bufio.NewReader(ureader),
@@ -100,15 +104,15 @@ func (s *ProxyServer) getConn(addr string, hash int) (*Connection, error) {
 	}
 }
 
-func (s *ProxyServer) returnConn(c *Connection, close bool) {
-	if close {
-		c.Conn.Close()
+func (s *ProxyServer) returnConn(c *Connection) {
+	if c.broken {
+		c.out.Close()
 	} else if c.Backend != nil {
-
+		c.Backend.returnConn()
 	} else {
 		s.idleMu.Lock()
 		if conns, ok := s.idleConn[c.Addr]; ok && len(conns) > MaxConPerHost {
-			c.Conn.Close()
+			c.out.Close()
 		} else {
 			c.LastActive = time.Now()
 			s.idleConn[c.Addr] = append(conns, c)
@@ -143,7 +147,7 @@ func getProxyHash(header http.Header) int {
 
 func getHost(r *http.Request) string {
 	h := r.URL.Host
-	if strings.Contains(":") {
+	if strings.Contains(h, ":") {
 		return h
 	} else {
 		return fmt.Sprint("%s:80", h)
@@ -233,7 +237,7 @@ func (p *Backend) getConn(addr string) (con *Connection, err error) {
 
 	ureader := NewPushBackReader(conn, 10)
 	return &Connection{
-		Conn: conn,
+		out: conn,
 		Addr: addr,
 		ureader: ureader,
 		Reader: bufio.NewReader(ureader),

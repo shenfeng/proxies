@@ -22,7 +22,7 @@ const (
 	MaxRetry      = 5
 	LatencySize   = 12
 	MaxConPerHost = 3
-	DailTimeOut   = 10 * time.Second
+	DailTimeOut   = 10*time.Second
 )
 
 func init() {
@@ -172,7 +172,7 @@ func (s *ProxyServer) tunnelTraffic(iconn net.Conn, brw *bufio.ReadWriter, r *ht
 }
 
 func (s *ProxyServer) fetchHTTP(c *Connection, req []byte) (*http.Response, error) {
-	c.Conn.SetDeadline(time.Now().Add(time.Minute * 1))
+	c.Conn.SetDeadline(time.Now().Add(time.Minute*1))
 	if _, err := c.Conn.Write(req); err != nil {
 		return nil, err
 	} else {
@@ -180,8 +180,10 @@ func (s *ProxyServer) fetchHTTP(c *Connection, req []byte) (*http.Response, erro
 	}
 }
 
-func (s *ProxyServer) proxyHttp(r *http.Request, c *Connection) {
-
+func (s *ProxyServer) proxyHttp(c *Connection) {
+	for {
+		c.Request.Write()
+	}
 }
 
 func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -202,8 +204,19 @@ func (s *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if conn, err := s.getConn(addr, hash); err == nil {
 			if ureader.IsHttpGet(addr) {
+				if r, err := http.ReadRequest(reader); err == nil {
+					conn.Request = r
+					conn.In = in
+					s.proxyHttp(conn)
+				} else {
+					conn.broken = true
+				}
+
+				s.returnConn(conn)
+
+
 				for {
-					r, err := http.ReadRequest(reader)
+
 					if err != nil {
 						break
 					}

@@ -1,10 +1,10 @@
 package main
 
 import (
-	"net/http"
 	"bufio"
-	"strings"
 	"log"
+	"net/http"
+	"strings"
 )
 
 type Reader strings.Reader
@@ -34,15 +34,15 @@ func HandleFunc(w http.ResponseWriter, r *http.Request) {
 			bufin := bufio.NewReader(in)
 			header := http.Header{}
 			body := "hello world"
-			resp := http.Response {
-				Status: "200 ok",
-				StatusCode: 200,
-				Proto: "http/1.1",
-				ProtoMajor: 1,
-				ProtoMinor: 1,
+			resp := http.Response{
+				Status:        "200 ok",
+				StatusCode:    200,
+				Proto:         "http/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
 				ContentLength: int64(len(body)),
-				Header: header,
-				Body: NewReader(body),
+				Header:        header,
+				Body:          NewReader(body),
 			}
 			if err := resp.Write(in); err != nil {
 				log.Println(err)
@@ -59,9 +59,8 @@ func HandleFunc(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	//	go func() {
-	http.ListenAndServe("0.0.0.0:8787", http.HandlerFunc(HandleFunc));
+	http.ListenAndServe("0.0.0.0:8787", http.HandlerFunc(HandleFunc))
 	//	}()
-
 
 	//	if ln, err := net.Listen("tcp", "0.0.0.0:7878"); err != nil {
 	//		log.Fatal(err)
